@@ -2162,7 +2162,7 @@ public class BcelShadow extends Shadow {
 		ResolvedType rt = (declaringAspectType.isParameterizedType() ? declaringAspectType.getGenericType() : declaringAspectType);
 		BcelObjectType ot = BcelWorld.getBcelObjectType(rt);
 		LazyMethodGen adviceMethod = ot.getLazyClassGen().getLazyMethodGen(mungerSig);
-		if (!adviceMethod.getCanInline()) {
+		if (!adviceMethod.getCanInline() && !this.getSignature().getName().contains("<init>")) {
 			weaveAroundClosure(munger, hasDynamicTest);
 			return;
 		}
@@ -2413,6 +2413,8 @@ public class BcelShadow extends Shadow {
 			end.addTargeter(lvt);
 			slot += args[argNumber].getSize();
 		}
+		
+		System.out.println("Finished inline weaving");
 	}
 
 	/**

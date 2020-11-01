@@ -389,7 +389,7 @@ class BcelAdvice extends Advice {
 						shadow.getSourceLocation());
 				return false;
 			}
-			if (!canInline(s)) {
+			if (!canInline(s) && !shadow.getSignature().getName().contains("<init>")) {
 				shadow.weaveAroundClosure(this, hasDynamicTests());
 			} else {
 				shadow.weaveAroundInline(this, hasDynamicTests());
