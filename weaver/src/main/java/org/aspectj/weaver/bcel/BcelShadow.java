@@ -2222,34 +2222,8 @@ public class BcelShadow extends Shadow {
 			extraParamOffset += thisJoinPointVar.getType().getSize();
 		}
 
-		// We use the munger signature here because it allows for any parameterization of the mungers pointcut that
-		// may have occurred ie. if the pointcut is p(T t) in the super aspect and that has become p(Foo t) in the sub aspect
-		// then here the munger signature will have 'Foo' as an argument in it whilst the adviceMethod argument type will be
-		// 'Object' - since it represents the advice method in the superaspect which uses the erasure of the type variable p(Object
-		// t) - see pr174449.
-
-		Type[] adviceParameterTypes = BcelWorld.makeBcelTypes(munger.getSignature().getParameterTypes());
-
-		// forces initialization ... dont like this but seems to be required for some tests to pass, I think that means there
-		// is a LazyMethodGen method that is not correctly setup to call initialize() when it is invoked - but I dont have
-		// time right now to discover which
-		adviceMethod.getArgumentTypes();
-
-		Type[] extractedMethodParameterTypes = extractedShadowMethod.getArgumentTypes();
-
-		Type[] parameterTypes = new Type[extractedMethodParameterTypes.length + adviceParameterTypes.length + 1];
-		int parameterIndex = 0;
-		System.arraycopy(extractedMethodParameterTypes, 0, parameterTypes, parameterIndex, extractedMethodParameterTypes.length);
-		parameterIndex += extractedMethodParameterTypes.length;
-		parameterTypes[parameterIndex++] = BcelWorld.makeBcelType(adviceMethod.getEnclosingClass().getType());
-		System.arraycopy(adviceParameterTypes, 0, parameterTypes, parameterIndex, adviceParameterTypes.length);
-
-		// Extract the advice into a new method. This will go in the same type as the shadow
-		// name will be something like foo_aroundBody1$advice
-		String localAdviceMethodName = NameMangler.aroundAdviceMethodName(getSignature(), shadowClass.getNewGeneratedNameTag());
-		int localAdviceMethodModifiers = Modifier.PRIVATE | (world.useFinal() & !shadowClassIsInterface ? Modifier.FINAL : 0) | Modifier.STATIC;
-		LazyMethodGen localAdviceMethod = new LazyMethodGen(localAdviceMethodModifiers, BcelWorld.makeBcelType(mungerSig.getReturnType()), localAdviceMethodName, parameterTypes,
-				NoDeclaredExceptions, shadowClass);
+		LazyMethodGen localAdviceMethod = creadeLocalAdviceMethod(munger, mungerSig, adviceMethod, shadowClass,
+				shadowClassIsInterface, extractedShadowMethod);
 
 		// Doesnt work properly, so leave it out:
 		// String aspectFilename = adviceMethod.getEnclosingClass().getInternalFileName();
@@ -2277,39 +2251,8 @@ public class BcelShadow extends Shadow {
 
 		localAdviceMethod.setMaxLocals(nVars);
 
-		// the shadow is now empty. First, create a correct call
-		// to the around advice. This includes both the call (which may involve
-		// value conversion of the advice arguments) and the return
-		// (which may involve value conversion of the return value). Right now
-		// we push a null for the unused closure. It's sad, but there it is.
-
-		InstructionList advice = new InstructionList();
-		// InstructionHandle adviceMethodInvocation;
-		{
-			for (BcelVar var : argsToCallLocalAdviceMethodWith) {
-				var.appendLoad(advice, fact);
-			}
-			// ??? we don't actually need to push NULL for the closure if we take care
-			boolean isAnnoStyleConcreteAspect = munger.getConcreteAspect().isAnnotationStyleAspect();
-			boolean isAnnoStyleDeclaringAspect = munger.getDeclaringAspect() != null ? munger.getDeclaringAspect().resolve(world)
-					.isAnnotationStyleAspect() : false;
-
-			InstructionList iList = null;
-			if (isAnnoStyleConcreteAspect && isAnnoStyleDeclaringAspect) {
-				iList = this.loadThisJoinPoint();
-				iList.append(Utility.createConversion(getFactory(), LazyClassGen.tjpType, LazyClassGen.proceedingTjpType));
-			} else {
-				iList = new InstructionList(InstructionConstants.ACONST_NULL);
-			}
-			advice.append(munger.getAdviceArgSetup(this, null, iList));
-			// adviceMethodInvocation =
-			advice.append(Utility.createInvoke(fact, localAdviceMethod)); // (fact, getWorld(), munger.getSignature()));
-			advice.append(Utility.createConversion(getFactory(), BcelWorld.makeBcelType(mungerSig.getReturnType()),
-					extractedShadowMethod.getReturnType(), world.isInJava5Mode()));
-			if (!isFallsThrough()) {
-				advice.append(InstructionFactory.createReturn(extractedShadowMethod.getReturnType()));
-			}
-		}
+		InstructionList advice = buildAdviceInstructionList(munger, mungerSig, extractedShadowMethod,
+				argsToCallLocalAdviceMethodWith, localAdviceMethod, fact);
 
 		// now, situate the call inside the possible dynamic tests,
 		// and actually add the whole mess to the shadow
@@ -2336,47 +2279,9 @@ public class BcelShadow extends Shadow {
 
 		// inlining support for code style aspects
 		if (!munger.getDeclaringType().isAnnotationStyleAspect()) {
-			String proceedName = NameMangler.proceedMethodName(munger.getSignature().getName());
-
-			InstructionHandle curr = localAdviceMethod.getBody().getStart();
-			InstructionHandle end = localAdviceMethod.getBody().getEnd();
-			ConstantPool cpg = localAdviceMethod.getEnclosingClass().getConstantPool();
-			while (curr != end) {
-				InstructionHandle next = curr.getNext();
-				Instruction inst = curr.getInstruction();
-				if ((inst.opcode == Constants.INVOKESTATIC) && proceedName.equals(((InvokeInstruction) inst).getMethodName(cpg))) {
-
-					localAdviceMethod.getBody().append(curr,
-							getRedoneProceedCall(fact, extractedShadowMethod, munger, localAdviceMethod, proceedVarList));
-					Utility.deleteInstruction(curr, localAdviceMethod);
-				}
-				curr = next;
-			}
-			// and that's it.
+			appendInstructions(munger, extractedShadowMethod, proceedVarList, localAdviceMethod, fact);
 		} else {
-			// ATAJ inlining support for @AJ aspects
-			// [TODO document @AJ code rule: don't manipulate 2 jps proceed at the same time.. in an advice body]
-			InstructionHandle curr = localAdviceMethod.getBody().getStart();
-			InstructionHandle end = localAdviceMethod.getBody().getEnd();
-			ConstantPool cpg = localAdviceMethod.getEnclosingClass().getConstantPool();
-			while (curr != end) {
-				InstructionHandle next = curr.getNext();
-				Instruction inst = curr.getInstruction();
-				if ((inst instanceof INVOKEINTERFACE) && "proceed".equals(((INVOKEINTERFACE) inst).getMethodName(cpg))) {
-					final boolean isProceedWithArgs;
-					if (((INVOKEINTERFACE) inst).getArgumentTypes(cpg).length == 1) {
-						// proceed with args as a boxed Object[]
-						isProceedWithArgs = true;
-					} else {
-						isProceedWithArgs = false;
-					}
-					InstructionList insteadProceedIl = getRedoneProceedCallForAnnotationStyle(fact, extractedShadowMethod, munger,
-							localAdviceMethod, proceedVarList, isProceedWithArgs);
-					localAdviceMethod.getBody().append(curr, insteadProceedIl);
-					Utility.deleteInstruction(curr, localAdviceMethod);
-				}
-				curr = next;
-			}
+			appendInstructionsAnnotationStyle(munger, extractedShadowMethod, proceedVarList, localAdviceMethod, fact);
 		}
 
 		// if (parameterNames.size() == 0) {
@@ -2413,6 +2318,126 @@ public class BcelShadow extends Shadow {
 			end.addTargeter(lvt);
 			slot += args[argNumber].getSize();
 		}
+	}
+
+	private void appendInstructionsAnnotationStyle(BcelAdvice munger, LazyMethodGen extractedShadowMethod,
+			List<BcelVar> proceedVarList, LazyMethodGen localAdviceMethod, final InstructionFactory fact) {
+		// ATAJ inlining support for @AJ aspects
+		// [TODO document @AJ code rule: don't manipulate 2 jps proceed at the same time.. in an advice body]
+		InstructionHandle curr = localAdviceMethod.getBody().getStart();
+		InstructionHandle end = localAdviceMethod.getBody().getEnd();
+		ConstantPool cpg = localAdviceMethod.getEnclosingClass().getConstantPool();
+		while (curr != end) {
+			InstructionHandle next = curr.getNext();
+			Instruction inst = curr.getInstruction();
+			if ((inst instanceof INVOKEINTERFACE) && "proceed".equals(((INVOKEINTERFACE) inst).getMethodName(cpg))) {
+				final boolean isProceedWithArgs;
+				if (((INVOKEINTERFACE) inst).getArgumentTypes(cpg).length == 1) {
+					// proceed with args as a boxed Object[]
+					isProceedWithArgs = true;
+				} else {
+					isProceedWithArgs = false;
+				}
+				InstructionList insteadProceedIl = getRedoneProceedCallForAnnotationStyle(fact, extractedShadowMethod, munger,
+						localAdviceMethod, proceedVarList, isProceedWithArgs);
+				localAdviceMethod.getBody().append(curr, insteadProceedIl);
+				Utility.deleteInstruction(curr, localAdviceMethod);
+			}
+			curr = next;
+		}
+	}
+
+	private void appendInstructions(BcelAdvice munger, LazyMethodGen extractedShadowMethod, List<BcelVar> proceedVarList,
+			LazyMethodGen localAdviceMethod, final InstructionFactory fact) {
+		String proceedName = NameMangler.proceedMethodName(munger.getSignature().getName());
+
+		InstructionHandle curr = localAdviceMethod.getBody().getStart();
+		InstructionHandle end = localAdviceMethod.getBody().getEnd();
+		ConstantPool cpg = localAdviceMethod.getEnclosingClass().getConstantPool();
+		while (curr != end) {
+			InstructionHandle next = curr.getNext();
+			Instruction inst = curr.getInstruction();
+			if ((inst.opcode == Constants.INVOKESTATIC) && proceedName.equals(((InvokeInstruction) inst).getMethodName(cpg))) {
+
+				localAdviceMethod.getBody().append(curr,
+						getRedoneProceedCall(fact, extractedShadowMethod, munger, localAdviceMethod, proceedVarList));
+				Utility.deleteInstruction(curr, localAdviceMethod);
+			}
+			curr = next;
+		}
+		// and that's it.
+	}
+
+	private InstructionList buildAdviceInstructionList(BcelAdvice munger, Member mungerSig,
+			LazyMethodGen extractedShadowMethod, List<BcelVar> argsToCallLocalAdviceMethodWith,
+			LazyMethodGen localAdviceMethod, final InstructionFactory fact) {
+		// the shadow is now empty. First, create a correct call
+		// to the around advice. This includes both the call (which may involve
+		// value conversion of the advice arguments) and the return
+		// (which may involve value conversion of the return value). Right now
+		// we push a null for the unused closure. It's sad, but there it is.
+
+		InstructionList advice = new InstructionList();
+		// InstructionHandle adviceMethodInvocation;
+		{
+			for (BcelVar var : argsToCallLocalAdviceMethodWith) {
+				var.appendLoad(advice, fact);
+			}
+			// ??? we don't actually need to push NULL for the closure if we take care
+			boolean isAnnoStyleConcreteAspect = munger.getConcreteAspect().isAnnotationStyleAspect();
+			boolean isAnnoStyleDeclaringAspect = munger.getDeclaringAspect() != null ? munger.getDeclaringAspect().resolve(world)
+					.isAnnotationStyleAspect() : false;
+
+			InstructionList iList = null;
+			if (isAnnoStyleConcreteAspect && isAnnoStyleDeclaringAspect) {
+				iList = this.loadThisJoinPoint();
+				iList.append(Utility.createConversion(getFactory(), LazyClassGen.tjpType, LazyClassGen.proceedingTjpType));
+			} else {
+				iList = new InstructionList(InstructionConstants.ACONST_NULL);
+			}
+			advice.append(munger.getAdviceArgSetup(this, null, iList));
+			// adviceMethodInvocation =
+			advice.append(Utility.createInvoke(fact, localAdviceMethod)); // (fact, getWorld(), munger.getSignature()));
+			advice.append(Utility.createConversion(getFactory(), BcelWorld.makeBcelType(mungerSig.getReturnType()),
+					extractedShadowMethod.getReturnType(), world.isInJava5Mode()));
+			if (!isFallsThrough()) {
+				advice.append(InstructionFactory.createReturn(extractedShadowMethod.getReturnType()));
+			}
+		}
+		return advice;
+	}
+
+	private LazyMethodGen creadeLocalAdviceMethod(BcelAdvice munger, Member mungerSig, LazyMethodGen adviceMethod,
+			LazyClassGen shadowClass, boolean shadowClassIsInterface, LazyMethodGen extractedShadowMethod) {
+		// We use the munger signature here because it allows for any parameterization of the mungers pointcut that
+		// may have occurred ie. if the pointcut is p(T t) in the super aspect and that has become p(Foo t) in the sub aspect
+		// then here the munger signature will have 'Foo' as an argument in it whilst the adviceMethod argument type will be
+		// 'Object' - since it represents the advice method in the superaspect which uses the erasure of the type variable p(Object
+		// t) - see pr174449.
+
+		Type[] adviceParameterTypes = BcelWorld.makeBcelTypes(munger.getSignature().getParameterTypes());
+
+		// forces initialization ... dont like this but seems to be required for some tests to pass, I think that means there
+		// is a LazyMethodGen method that is not correctly setup to call initialize() when it is invoked - but I dont have
+		// time right now to discover which
+		adviceMethod.getArgumentTypes();
+
+		Type[] extractedMethodParameterTypes = extractedShadowMethod.getArgumentTypes();
+
+		Type[] parameterTypes = new Type[extractedMethodParameterTypes.length + adviceParameterTypes.length + 1];
+		int parameterIndex = 0;
+		System.arraycopy(extractedMethodParameterTypes, 0, parameterTypes, parameterIndex, extractedMethodParameterTypes.length);
+		parameterIndex += extractedMethodParameterTypes.length;
+		parameterTypes[parameterIndex++] = BcelWorld.makeBcelType(adviceMethod.getEnclosingClass().getType());
+		System.arraycopy(adviceParameterTypes, 0, parameterTypes, parameterIndex, adviceParameterTypes.length);
+
+		// Extract the advice into a new method. This will go in the same type as the shadow
+		// name will be something like foo_aroundBody1$advice
+		String localAdviceMethodName = NameMangler.aroundAdviceMethodName(getSignature(), shadowClass.getNewGeneratedNameTag());
+		int localAdviceMethodModifiers = Modifier.PRIVATE | (world.useFinal() & !shadowClassIsInterface ? Modifier.FINAL : 0) | Modifier.STATIC;
+		LazyMethodGen localAdviceMethod = new LazyMethodGen(localAdviceMethodModifiers, BcelWorld.makeBcelType(mungerSig.getReturnType()), localAdviceMethodName, parameterTypes,
+				NoDeclaredExceptions, shadowClass);
+		return localAdviceMethod;
 	}
 
 	/**
@@ -2912,47 +2937,14 @@ public class BcelShadow extends Shadow {
 			}
 		}
 
-		// initialize the bit flags for this shadow
-		int bitflags = 0x000000;
-		if (getKind().isTargetSameAsThis()) {
-			bitflags |= 0x010000;
-		}
-		if (hasThis()) {
-			bitflags |= 0x001000;
-		}
-		if (bindsThis(munger)) {
-			bitflags |= 0x000100;
-		}
-		if (hasTarget()) {
-			bitflags |= 0x000010;
-		}
-		if (bindsTarget(munger)) {
-			bitflags |= 0x000001;
-		}
+		int bitflags = getBitflags(munger);
 
 		closureVarInitialized = false;
 
 		// ATAJ for @AJ aspect we need to link the closure with the joinpoint instance
 		if (munger.getConcreteAspect() != null && munger.getConcreteAspect().isAnnotationStyleAspect()
 				&& munger.getDeclaringAspect() != null && munger.getDeclaringAspect().resolve(world).isAnnotationStyleAspect()) {
-
-			aroundClosureInstance = genTempVar(AjcMemberMaker.AROUND_CLOSURE_TYPE);
-			closureInstantiation.append(fact.createDup(1));
-			aroundClosureInstance.appendStore(closureInstantiation, fact);
-
-			// stick the bitflags on the stack and call the variant of linkClosureAndJoinPoint that takes an int
-			closureInstantiation.append(fact.createConstant(bitflags));
-			if (needAroundClosureStacking) {
-				closureInstantiation.append(Utility.createInvoke(getFactory(), getWorld(),
-						new MemberImpl(Member.METHOD, UnresolvedType.forName("org.aspectj.runtime.internal.AroundClosure"),
-								Modifier.PUBLIC, "linkStackClosureAndJoinPoint", String.format("%s%s", "(I)", "Lorg/aspectj/lang/ProceedingJoinPoint;"))));
-
-			} else {
-				closureInstantiation.append(Utility.createInvoke(getFactory(), getWorld(),
-						new MemberImpl(Member.METHOD, UnresolvedType.forName("org.aspectj.runtime.internal.AroundClosure"),
-								Modifier.PUBLIC, "linkClosureAndJoinPoint", String.format("%s%s", "(I)", "Lorg/aspectj/lang/ProceedingJoinPoint;"))));
-			}
-
+			linkClosureAndJoinpoints(fact, closureInstantiation, bitflags);
 		}
 
 		InstructionList advice = new InstructionList();
@@ -2962,32 +2954,7 @@ public class BcelShadow extends Shadow {
 		InstructionHandle tryUnlinkPosition  = advice.append(munger.getNonTestAdviceInstructions(this));
 
 		if (needAroundClosureStacking) {
-			// Call AroundClosure.unlink() in a 'finally' block
-			if (munger.getConcreteAspect() != null && munger.getConcreteAspect().isAnnotationStyleAspect()
-					&& munger.getDeclaringAspect() != null
-					&& munger.getDeclaringAspect().resolve(world).isAnnotationStyleAspect()
-					&& closureVarInitialized) {
-
-				// Call unlink when 'normal' flow occurring
-				aroundClosureInstance.appendLoad(advice, fact);
-				InstructionHandle unlinkInsn = advice.append(Utility.createInvoke(getFactory(), getWorld(), new MemberImpl(Member.METHOD, UnresolvedType
-						.forName("org.aspectj.runtime.internal.AroundClosure"), Modifier.PUBLIC, "unlink",
-						"()V")));
-
-				BranchHandle jumpOverHandler = advice.append(new InstructionBranch(Constants.GOTO, null));
-				// Call unlink in finally block
-
-				// Do not POP the exception off, we need to rethrow it
-				InstructionHandle handlerStart = advice.append(aroundClosureInstance.createLoad(fact));
-				advice.append(Utility.createInvoke(getFactory(), getWorld(), new MemberImpl(Member.METHOD, UnresolvedType
-						.forName("org.aspectj.runtime.internal.AroundClosure"), Modifier.PUBLIC, "unlink",
-						"()V")));
-				// After that exception is on the top of the stack again
-				advice.append(InstructionConstants.ATHROW);
-				InstructionHandle jumpTarget = advice.append(InstructionConstants.NOP);
-				jumpOverHandler.setTarget(jumpTarget);
-				enclosingMethod.addExceptionHandler(tryUnlinkPosition, unlinkInsn, handlerStart, null/* ==finally */, false);
-			}
+			stackAroundClosure(munger, fact, advice, tryUnlinkPosition);
 		}
 
 		advice.append(returnConversionCode);
@@ -3011,6 +2978,76 @@ public class BcelShadow extends Shadow {
 			range.append(callback);
 			range.append(postCallback);
 		}
+	}
+
+	private void linkClosureAndJoinpoints(InstructionFactory fact, InstructionList closureInstantiation, int bitflags) {
+		aroundClosureInstance = genTempVar(AjcMemberMaker.AROUND_CLOSURE_TYPE);
+		closureInstantiation.append(fact.createDup(1));
+		aroundClosureInstance.appendStore(closureInstantiation, fact);
+
+		// stick the bitflags on the stack and call the variant of linkClosureAndJoinPoint that takes an int
+		closureInstantiation.append(fact.createConstant(bitflags));
+		if (needAroundClosureStacking) {
+			closureInstantiation.append(Utility.createInvoke(getFactory(), getWorld(),
+					new MemberImpl(Member.METHOD, UnresolvedType.forName("org.aspectj.runtime.internal.AroundClosure"),
+							Modifier.PUBLIC, "linkStackClosureAndJoinPoint", String.format("%s%s", "(I)", "Lorg/aspectj/lang/ProceedingJoinPoint;"))));
+
+		} else {
+			closureInstantiation.append(Utility.createInvoke(getFactory(), getWorld(),
+					new MemberImpl(Member.METHOD, UnresolvedType.forName("org.aspectj.runtime.internal.AroundClosure"),
+							Modifier.PUBLIC, "linkClosureAndJoinPoint", String.format("%s%s", "(I)", "Lorg/aspectj/lang/ProceedingJoinPoint;"))));
+		}
+	}
+
+	private void stackAroundClosure(BcelAdvice munger, InstructionFactory fact, InstructionList advice,
+			InstructionHandle tryUnlinkPosition) {
+		// Call AroundClosure.unlink() in a 'finally' block
+		if (munger.getConcreteAspect() != null && munger.getConcreteAspect().isAnnotationStyleAspect()
+				&& munger.getDeclaringAspect() != null
+				&& munger.getDeclaringAspect().resolve(world).isAnnotationStyleAspect()
+				&& closureVarInitialized) {
+
+			// Call unlink when 'normal' flow occurring
+			aroundClosureInstance.appendLoad(advice, fact);
+			InstructionHandle unlinkInsn = advice.append(Utility.createInvoke(getFactory(), getWorld(), new MemberImpl(Member.METHOD, UnresolvedType
+					.forName("org.aspectj.runtime.internal.AroundClosure"), Modifier.PUBLIC, "unlink",
+					"()V")));
+
+			BranchHandle jumpOverHandler = advice.append(new InstructionBranch(Constants.GOTO, null));
+			// Call unlink in finally block
+
+			// Do not POP the exception off, we need to rethrow it
+			InstructionHandle handlerStart = advice.append(aroundClosureInstance.createLoad(fact));
+			advice.append(Utility.createInvoke(getFactory(), getWorld(), new MemberImpl(Member.METHOD, UnresolvedType
+					.forName("org.aspectj.runtime.internal.AroundClosure"), Modifier.PUBLIC, "unlink",
+					"()V")));
+			// After that exception is on the top of the stack again
+			advice.append(InstructionConstants.ATHROW);
+			InstructionHandle jumpTarget = advice.append(InstructionConstants.NOP);
+			jumpOverHandler.setTarget(jumpTarget);
+			enclosingMethod.addExceptionHandler(tryUnlinkPosition, unlinkInsn, handlerStart, null/* ==finally */, false);
+		}
+	}
+
+	private int getBitflags(BcelAdvice munger) {
+		// initialize the bit flags for this shadow
+		int bitflags = 0x000000;
+		if (getKind().isTargetSameAsThis()) {
+			bitflags |= 0x010000;
+		}
+		if (hasThis()) {
+			bitflags |= 0x001000;
+		}
+		if (bindsThis(munger)) {
+			bitflags |= 0x000100;
+		}
+		if (hasTarget()) {
+			bitflags |= 0x000010;
+		}
+		if (bindsTarget(munger)) {
+			bitflags |= 0x000001;
+		}
+		return bitflags;
 	}
 
 	// exposed for testing
