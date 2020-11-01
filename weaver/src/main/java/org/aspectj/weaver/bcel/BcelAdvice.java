@@ -154,6 +154,10 @@ class BcelAdvice extends Advice {
 
 	@Override
 	public boolean match(Shadow shadow, World world) {
+		System.out.println(shadow.getKind().toString() + " " + shadow.getKind().toString().equals("field-set"));
+		if (shadow.getKind().toString().equals("field-set")) {
+			return false;
+		}
 		if (world.areAllLintIgnored()) {
 			return super.match(shadow, world);
 		} else {
